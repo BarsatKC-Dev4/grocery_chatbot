@@ -1,0 +1,175 @@
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import os
+from dotenv import load_dotenv
+import psycopg2
+import base64
+from fuzzywuzzy import fuzz
+import logging
+import re
+# LangChain
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains import LLMChain
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# FastAPI app
+app = FastAPI()
+
+# Allow CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # frontend address
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Connect to PostgreSQL database
+conn = psycopg2.connect(
+    host="localhost",
+    database="grocery_store2",
+    user="postgres",
+    password="barsat2000@",
+    port="5432"
+)
+
+# Pydantic model
+class QueryRequest(BaseModel):
+    query: str
+
+# Set up Gemini LLM
+llm = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",  # Updated to a more recent model for better performance
+    google_api_key=os.getenv("GEMINI_API_KEY"),
+)
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to Grocery Assistant!"}
+
+@app.post("/chat")
+async def chat_with_ai(request: QueryRequest):
+    try:
+        user_input = request.query.lower()
+        logger.info(f"Received user query: {user_input}")
+
+        # Fetch inventory + image data
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT inventoryid, productname, cost FROM inventory_table;
+        """)
+        inventory_rows = cursor.fetchall()
+
+        inventory_map = {}
+        price_map = {}
+        for inventoryid, productname, retailPrice in inventory_rows:
+            inventory_map[inventoryid] = productname
+            price_map[inventoryid] = retailPrice
+
+        # Fetch one image per inventoryid to prevent duplicates
+        cursor.execute("""
+            SELECT DISTINCT ON (inventoryid) id, picture, inventoryid 
+            FROM image_table;
+        """)
+        img_rows = cursor.fetchall()
+
+        images_info = []
+        for img_row in img_rows:
+            img_id, img_binary, img_inventoryid = img_row
+            encoded_image = base64.b64encode(img_binary).decode('utf-8')
+            images_info.append({
+                "id": img_id,
+                "product_name": inventory_map.get(img_inventoryid, "Unknown"),
+                "price": price_map.get(img_inventoryid, "N/A"),
+                "image_base64": encoded_image
+            })
+
+        cursor.close()
+
+        # Build product list for AI prompt
+        product_list_for_prompt = "\n".join(
+            [f"- {item['product_name']} (Price: Rs. {item['price']})" for item in images_info]
+        )
+
+        # Updated prompt
+        full_prompt = f"""
+You are a friendly and knowledgeable AI assistant for a Nepali online grocery store. Your role is to assist users with their grocery-related queries in a clear, concise, and helpful manner. Respond in markdown format for easy rendering.
+
+### Tasks You Can Perform:
+1. **Product Lookup**: Find products by name or keyword. If the user asks for a product, return its name and price. If no exact match is found, suggest the closest matching product.
+2. **Price Information**: Provide the price of a specific product when asked.
+3. **Image Display**: If the user requests an image (e.g., "show", "picture", "photo"), indicate that the image will be displayed alongside the response.
+4. **Image Requests**: If the user asks for an image (e.g., "show", "picture", "photo"), focus on the product details without mentioning the image, as it’s handled separately.
+5. **Recipe Suggestions**: Suggest simple recipes using available products. Use the product list to recommend ingredients.
+6. **Product Recommendations**: Recommend complementary products based on the user's query (e.g., suggest butter if they ask for bread).
+
+### Available Products:
+{product_list_for_prompt}
+
+### Instructions:
+- Always respond in markdown format (e.g., use **bold** for emphasis, bullet points for lists).
+- If the user asks for a product, include its name and price (e.g., "**Apple** - Rs. 100").
+- For image requests, describe the product naturally alongwith mentioning the image.
+- If the user requests an image, include a note like: "show the image"
+- For recipes, suggest a simple recipe with 2-3 available ingredients and brief steps.
+- For recommendations, suggest 1-2 related products from the list.
+- If the query doesn't match any products or tasks, respond politely with: "Sorry, I couldn't find that product or understand your request. Please try again or ask about another product!"
+- Keep responses concise and relevant to the user's query.
+
+### User Query:
+{user_input}
+"""
+
+        prompt = ChatPromptTemplate.from_template("{context}")
+        chain = LLMChain(llm=llm, prompt=prompt)
+
+        response = chain.invoke({"context": full_prompt})
+        reply_text = response["text"]
+        logger.info(f"LLM response: {reply_text}")
+
+        # Detect if user is asking for an image
+        image_related_keywords = ["show", "picture", "image", "photo", "see", "display", "view"]
+        is_requesting_image = any(keyword in user_input for keyword in image_related_keywords)
+
+        requested_images = []
+        if is_requesting_image:
+            # Split query into product candidates (e.g., "apples and octopus" -> ["apples", "octopus"])
+            product_candidates = re.split(r'\band\b|,', user_input.lower())
+            product_candidates = [p.strip() for p in product_candidates if p.strip()]
+
+            # Find matches for each candidate
+            for candidate in product_candidates:
+                best_match = None
+                highest_score = 0
+                for item in images_info:
+                    score = fuzz.token_set_ratio(item["product_name"].lower(), candidate)
+                    if score > highest_score:
+                        highest_score = score
+                        best_match = item
+                if best_match and highest_score > 70:  # Adjust threshold as needed
+                    requested_images.append(best_match)
+
+            # Remove duplicates based on image id
+            requested_images = list({item["id"]: item for item in requested_images}.values())
+
+        logger.info(f"Returning {len(requested_images)} images")
+        return {
+            "success": True,
+            "response": reply_text,
+            "images": requested_images
+        }
+
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return {"success": False, "response": "Something went wrong. Please try again."}
+
